@@ -259,8 +259,12 @@ cmake --build build --target splat_vk
 python3 trainer/bootstrap.py video.mp4 -o out
 ```
 
-You need an NVIDIA driver with Vulkan support (on Ubuntu, the
-`libnvidia-gl-*` package provides the Vulkan ICD) plus `libvulkan1`. There is
+You need an NVIDIA driver with Vulkan support plus `libvulkan1`. Many GPU
+containers and notebooks only ship the CUDA half of the driver. On those,
+`bash trainer/install_vulkan.sh` installs the Vulkan loader, then copies
+NVIDIA's Vulkan userspace libraries and ICD manifest for exactly the running
+driver version (taken from NVIDIA's installer, with no kernel module), and
+checks the result with `vulkaninfo`. There is
 also a Dockerfile; it needs the NVIDIA Container Toolkit on the host:
 
 ```sh
@@ -274,9 +278,9 @@ File > Load Scene.
 **Free notebooks (Colab / Kaggle).** `trainer/colab.ipynb` runs the trainer
 on a free T4 notebook GPU. It does the following:
 
-1. Installs the Vulkan loader and checks that the runtime exposes NVIDIA's
-   Vulkan driver; it stops if not.
-2. Builds the module.
+1. Builds the module.
+2. Runs `install_vulkan.sh` to install Vulkan if the runtime lacks it; it
+   stops if Vulkan still cannot be used.
 3. Takes an uploaded video, or a Kaggle dataset path.
 4. Trains, showing a preview image every `PREVIEW_EVERY` iterations.
 5. Zips the model for download.

@@ -1,0 +1,2 @@
+# Shell scripts run on Linux (cloud/notebooks) even when checked out on Windows.
+*.sh text eol=lf
