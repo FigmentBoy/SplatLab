@@ -23,7 +23,8 @@ have_nvidia_vulkan() {
 if ! command -v vulkaninfo >/dev/null 2>&1 || ! ldconfig -p | grep -q "libvulkan.so.1"; then
     echo "== Installing the Vulkan loader"
     $SUDO apt-get -qq update >/dev/null
-    $SUDO apt-get -qq install -y libvulkan1 vulkan-tools >/dev/null
+    $SUDO apt-get -qq install -y libnvidia-gl-525 >/dev/null
+    $SUDO apt-get -qq install -y libvulkan1 vulkan-tools libvulkan-dev >/dev/null
 fi
 
 if have_nvidia_vulkan; then
