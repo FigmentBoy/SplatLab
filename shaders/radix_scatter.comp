@@ -1,0 +1,67 @@
+#version 460
+// Radix sort pass 2: stable scatter by 8-bit digit. Each block walks its
+// chunks in order; within a chunk, keys are ranked per digit with subgroup
+// ballots, then across subgroups with a per-digit prefix over shared counts.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "radix_common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    UintBuf keysIn;
+    UintBuf valuesIn;
+    UintBuf keysOut;
+    UintBuf valuesOut;
+    UintBuf histogram; // exclusive-scanned digit-major histogram
+    UintBuf countBuf;  // v[0]: number of keys
+    uint maxCount;
+    uint shift;
+    uint numBlocks;
+} pc;
+
+shared uint sDigitOffset[256];                     // next output slot of each digit
+shared uint sSubgroupCounts[NUM_SUBGROUPS * 256u]; // [subgroup][digit]
+
+void main() {
+    uint block = linearGroupId();
+    if (block >= pc.numBlocks) return;
+    uint count = min(pc.countBuf.v[0], pc.maxCount);
+    uint start = block * RADIX_BLOCK;
+    if (start >= count) return;
+    uint tid = gl_LocalInvocationIndex;
+    uint sg = gl_SubgroupID;
+
+    sDigitOffset[tid] = pc.histogram.v[tid * pc.numBlocks + block];
+    uint chunks = min(RADIX_CHUNKS, (count - start + 255u) / 256u);
+    for (uint c = 0u; c < chunks; ++c) {
+        for (uint s = 0u; s < NUM_SUBGROUPS; ++s) sSubgroupCounts[s * 256u + tid] = 0u;
+        barrier();
+
+        uint i = start + c * 256u + chunkLane();
+        bool valid = i < count;
+        uint key = valid ? pc.keysIn.v[i] : 0u;
+        uint digit = (key >> pc.shift) & 255u;
+        uvec4 peers = digitPeers(digit, valid);
+        uint rank = subgroupBallotExclusiveBitCount(peers);
+        if (valid && rank == 0u) sSubgroupCounts[sg * 256u + digit] = subgroupBallotBitCount(peers);
+        barrier();
+
+        // Invocation `tid` owns digit `tid`: exclusive prefix over subgroups.
+        uint total = 0u;
+        for (uint s = 0u; s < NUM_SUBGROUPS; ++s) {
+            uint n = sSubgroupCounts[s * 256u + tid];
+            sSubgroupCounts[s * 256u + tid] = total;
+            total += n;
+        }
+        barrier();
+
+        if (valid) {
+            uint dst = sDigitOffset[digit] + sSubgroupCounts[sg * 256u + digit] + rank;
+            pc.keysOut.v[dst] = key;
+            pc.valuesOut.v[dst] = pc.valuesIn.v[i];
+        }
+        barrier();
+        sDigitOffset[tid] += total;
+    }
+}

@@ -1,0 +1,98 @@
+#version 460
+// Tile-based front-to-back alpha compositing (one workgroup per 16x16 tile).
+// Besides the colour, it stores the per-pixel final transmittance and the index
+// of the last contributing Gaussian, which the backward pass will need.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform PushConstants {
+    FrameParamsRef params;
+    UVec2Buf ranges;
+    UintBuf values;       // sorted Gaussian indices
+    Vec2Buf means2D;
+    Vec4Buf conicOpacity;
+    Vec4Buf colorDepth;
+    FloatBuf outColor;    // planar CHW float image
+    FloatBuf outFinalT;   // H*W final transmittance
+    UintBuf outNContrib;  // H*W index (within tile list) of last contributor + 1
+} pc;
+
+shared vec3 sColors[TILE_PIXELS];
+shared vec2 sMeans[TILE_PIXELS];
+shared vec4 sConicOpacity[TILE_PIXELS];
+shared uint sDoneCount;
+
+void main() {
+    uint width = pc.params.dims.x;
+    uint height = pc.params.dims.y;
+    uint tilesX = pc.params.dims.z;
+    uint tid = gl_LocalInvocationIndex;
+
+    uvec2 pix = gl_WorkGroupID.xy * TILE_SIZE + gl_LocalInvocationID.xy;
+    uint pixId = width * pix.y + pix.x;
+    vec2 pixf = vec2(pix);
+    bool inside = pix.x < width && pix.y < height;
+    bool done = !inside;
+
+    uvec2 range = pc.ranges.v[gl_WorkGroupID.y * tilesX + gl_WorkGroupID.x];
+    int toDo = int(range.y - range.x);
+    uint rounds = (range.y - range.x + TILE_PIXELS - 1u) / TILE_PIXELS;
+
+    float T = 1.0;
+    uint contributor = 0u;
+    uint lastContributor = 0u;
+    vec3 C = vec3(0.0);
+
+    for (uint r = 0u; r < rounds; ++r, toDo -= int(TILE_PIXELS)) {
+        // Stop once every pixel of the tile is saturated.
+        if (tid == 0u) sDoneCount = 0u;
+        barrier();
+        if (done) atomicAdd(sDoneCount, 1u);
+        barrier();
+        uint doneCount = sDoneCount;
+        barrier();
+        if (doneCount == TILE_PIXELS) break;
+
+        // Cooperatively fetch the next batch of Gaussians into shared memory.
+        uint progress = r * TILE_PIXELS + tid;
+        if (range.x + progress < range.y) {
+            uint id = pc.values.v[range.x + progress];
+            sColors[tid] = pc.colorDepth.v[id].rgb;
+            sMeans[tid] = pc.means2D.v[id];
+            sConicOpacity[tid] = pc.conicOpacity.v[id];
+        }
+        barrier();
+
+        uint batch = uint(min(int(TILE_PIXELS), toDo));
+        for (uint j = 0u; !done && j < batch; ++j) {
+            ++contributor;
+            vec2 d = sMeans[j] - pixf;
+            vec4 co = sConicOpacity[j];
+            float power = -0.5 * (co.x * d.x * d.x + co.z * d.y * d.y) - co.y * d.x * d.y;
+            if (power > 0.0) continue;
+
+            float alpha = min(0.99, co.w * exp(power));
+            if (alpha < 1.0 / 255.0) continue;
+            float testT = T * (1.0 - alpha);
+            if (testT < 0.0001) {
+                done = true;
+                continue;
+            }
+            C += sColors[j] * alpha * T;
+            T = testT;
+            lastContributor = contributor;
+        }
+    }
+
+    if (inside) {
+        uint planeSize = width * height;
+        vec3 bg = pc.params.background.rgb;
+        pc.outColor.v[pixId] = C.r + T * bg.r;
+        pc.outColor.v[planeSize + pixId] = C.g + T * bg.g;
+        pc.outColor.v[2u * planeSize + pixId] = C.b + T * bg.b;
+        pc.outFinalT.v[pixId] = T;
+        pc.outNContrib.v[pixId] = lastContributor;
+    }
+}

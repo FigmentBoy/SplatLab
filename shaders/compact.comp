@@ -1,0 +1,26 @@
+#version 460
+// Stream compaction of the visible Gaussians into (depth, index) pairs for
+// the depth sort, preserving index order (the sort is stable, so ties in
+// depth keep the reference rasterizer's order).
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    FrameParamsRef params;
+    UintBuf visibleScan; // exclusive scan of the visible flags
+    Vec4Buf colorDepth;
+    UintBuf depthKeys;   // out
+    UintBuf indices;     // out
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.params.misc.x) return;
+    uint pos = pc.visibleScan.v[idx];
+    if (pc.visibleScan.v[idx + 1u] == pos) return; // not visible
+    // Depth > nearCull > 0, so its IEEE bits sort like unsigned integers.
+    pc.depthKeys.v[pos] = floatBitsToUint(pc.colorDepth.v[idx].w);
+    pc.indices.v[pos] = idx;
+}

@@ -1,0 +1,46 @@
+#version 460
+// Radix sort pass 1: per-block 8-bit digit histogram, stored digit-major
+// (hist[digit * numBlocks + block]) so one exclusive scan yields global offsets.
+// The key count is read on the GPU; blocks past it write zero counts.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "radix_common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    UintBuf keys;
+    UintBuf histogram;
+    UintBuf countBuf; // v[0]: number of keys
+    uint maxCount;
+    uint shift;
+    uint numBlocks;
+} pc;
+
+shared uint sCounts[256];
+
+void main() {
+    uint block = linearGroupId();
+    if (block >= pc.numBlocks) return;
+    uint tid = gl_LocalInvocationIndex;
+    uint count = min(pc.countBuf.v[0], pc.maxCount);
+
+    sCounts[tid] = 0u;
+    barrier();
+    uint start = block * RADIX_BLOCK;
+    if (start < count) {
+        for (uint c = 0u; c < RADIX_CHUNKS; ++c) {
+            uint i = start + c * 256u + chunkLane();
+            bool valid = i < count;
+            uint digit = valid ? (pc.keys.v[i] >> pc.shift) & 255u : 0u;
+            // One shared atomic per distinct digit per subgroup (depth keys
+            // share their high digits, so per-key atomics would serialize).
+            uvec4 peers = digitPeers(digit, valid);
+            if (valid && subgroupBallotExclusiveBitCount(peers) == 0u) {
+                atomicAdd(sCounts[digit], subgroupBallotBitCount(peers));
+            }
+        }
+    }
+    barrier();
+    pc.histogram.v[tid * pc.numBlocks + block] = sCounts[tid];
+}

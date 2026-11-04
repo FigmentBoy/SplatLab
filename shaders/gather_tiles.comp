@@ -1,0 +1,22 @@
+#version 460
+// Tile counts of the depth-sorted visible Gaussians, for the instance offsets
+// (entries from the visible count up to N are zeroed).
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    FrameParamsRef params;
+    UintBuf visibleCount;  // v[0]
+    UintBuf sortedIndices; // depth-sorted Gaussian indices
+    UintBuf tilesTouched;
+    UintBuf counts;        // out: N + 1 entries
+} pc;
+
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    uint n = pc.params.misc.x;
+    if (j > n) return;
+    pc.counts.v[j] = j < pc.visibleCount.v[0] ? pc.tilesTouched.v[pc.sortedIndices.v[j]] : 0u;
+}

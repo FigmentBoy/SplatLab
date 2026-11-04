@@ -1,0 +1,54 @@
+#version 460
+// Emits one (tile, Gaussian) instance per Gaussian/tile overlap. Gaussians are
+// visited in depth order, so each tile's instances are depth-sorted and only
+// a stable sort by tile id remains.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    FrameParamsRef params;
+    UintBuf visibleCount;  // v[0]
+    UintBuf sortedIndices; // depth-sorted Gaussian indices
+    UintBuf offsets;       // exclusive scan of the sorted tile counts
+    Vec2Buf means2D;
+    Vec4Buf conicOpacity;
+    IntBuf radii;
+    UintBuf tileKeys;      // out
+    UintBuf values;        // out: Gaussian index
+    uint capacity;         // size of tileKeys / values
+    uint sentinel;         // tile key that sorts after every real tile
+} pc;
+
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.visibleCount.v[0]) return;
+    uint idx = pc.sortedIndices.v[j];
+    uint off = pc.offsets.v[j];
+    uint end = pc.offsets.v[j + 1u];
+
+    vec2 mean = pc.means2D.v[idx];
+    vec4 co = pc.conicOpacity.v[idx];
+    ivec2 grid = ivec2(pc.params.dims.zw);
+    ivec2 rectMin, rectMax;
+    float limit;
+    tileBounds(mean, co, pc.radii.v[idx], grid, pc.params.misc.z != 0u, rectMin, rectMax, limit);
+    for (int y = rectMin.y; y < rectMax.y; ++y) {
+        for (int x = rectMin.x; x < rectMax.x; ++x) {
+            if (off < end && tileOverlaps(mean, co.xyz, limit, ivec2(x, y))) {
+                if (off < pc.capacity) {
+                    pc.tileKeys.v[off] = uint(y) * uint(grid.x) + uint(x);
+                    pc.values.v[off] = idx;
+                }
+                ++off;
+            }
+        }
+    }
+    // Same test as preprocess, so this only runs if the compiler evaluated it
+    // differently there; the padding sorts last and is never rendered.
+    for (; off < min(end, pc.capacity); ++off) {
+        pc.tileKeys.v[off] = pc.sentinel;
+        pc.values.v[off] = idx;
+    }
+}

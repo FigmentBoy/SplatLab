@@ -1,0 +1,24 @@
+#version 460
+// Adds the scanned block offsets back into each 2048-element block.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    UintBuf data;
+    UintBuf blockSums;
+    uint count;
+    uint numBlocks;
+} pc;
+
+void main() {
+    uint block = linearGroupId();
+    if (block >= pc.numBlocks) return;
+    uint offset = pc.blockSums.v[block];
+    // Consecutive invocations touch consecutive elements.
+    for (uint k = 0u; k < 8u; ++k) {
+        uint i = block * 2048u + k * 256u + gl_LocalInvocationIndex;
+        if (i < pc.count) pc.data.v[i] += offset;
+    }
+}

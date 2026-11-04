@@ -1,0 +1,32 @@
+#version 460
+// Converts the planar float image into packed 8-bit RGBA (or BGRA) for
+// presentation and PNG output.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    UintBuf outPacked;
+    FloatBuf color;
+    uint width;
+    uint height;
+    uint swapRedBlue;
+} pc;
+
+uint toByte(float v) {
+    return uint(clamp(v, 0.0, 1.0) * 255.0 + 0.5);
+}
+
+void main() {
+    uint i = linearGroupId() * 256u + gl_LocalInvocationID.x;
+    uint planeSize = pc.width * pc.height;
+    if (i >= planeSize) return;
+    uint r = toByte(pc.color.v[i]);
+    uint g = toByte(pc.color.v[planeSize + i]);
+    uint b = toByte(pc.color.v[2u * planeSize + i]);
+    if (pc.swapRedBlue != 0u) {
+        uint tmp = r; r = b; b = tmp;
+    }
+    pc.outPacked.v[i] = r | (g << 8u) | (b << 16u) | (255u << 24u);
+}

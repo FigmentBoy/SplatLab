@@ -1,0 +1,26 @@
+#version 460
+// Finds the [start, end) range of each tile in the sorted instance list.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    UintBuf keysTile;  // sorted
+    UVec2Buf ranges;   // out, cleared to zero beforehand
+    UintBuf countBuf;  // v[0]: number of instances
+    uint capacity;
+    uint numTiles;     // keys >= numTiles are padding
+} pc;
+
+void main() {
+    uint i = linearGroupId() * 256u + gl_LocalInvocationID.x;
+    uint count = min(pc.countBuf.v[0], pc.capacity);
+    if (i >= count) return;
+    uint tile = pc.keysTile.v[i];
+    uint prevTile = i == 0u ? 0xFFFFFFFFu : pc.keysTile.v[i - 1u];
+    if (i == count - 1u && tile < pc.numTiles) pc.ranges.v[tile].y = count;
+    if (tile == prevTile) return;
+    if (tile < pc.numTiles) pc.ranges.v[tile].x = i;
+    if (prevTile < pc.numTiles) pc.ranges.v[prevTile].y = i;
+}

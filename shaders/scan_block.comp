@@ -1,0 +1,55 @@
+#version 460
+// Exclusive prefix sum over blocks of 2048 uints (in place, 8 per invocation).
+// Optionally writes each block's total to blockSums for the next scan level.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(constant_id = 0) const uint SUBGROUP_SIZE = 32u;
+const uint NUM_SUBGROUPS = 256u / SUBGROUP_SIZE;
+
+layout(push_constant) uniform PushConstants {
+    UintBuf data;
+    UintBuf blockSums;
+    uint count;
+    uint numBlocks;
+    uint writeBlockSums;
+} pc;
+
+shared uint sSubgroupSums[NUM_SUBGROUPS];
+
+void main() {
+    uint block = linearGroupId();
+    if (block >= pc.numBlocks) return;
+    // Linear index in subgroup order, so subgroup scans follow element order.
+    uint lane = gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID;
+    uint base = block * 2048u + lane * 8u;
+
+    uint v[8];
+    uint sum = 0u;
+    for (uint k = 0u; k < 8u; ++k) {
+        v[k] = base + k < pc.count ? pc.data.v[base + k] : 0u;
+        sum += v[k];
+    }
+    uint inclusive = subgroupInclusiveAdd(sum);
+    if (gl_SubgroupInvocationID == gl_SubgroupSize - 1u) sSubgroupSums[gl_SubgroupID] = inclusive;
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        uint running = 0u;
+        for (uint s = 0u; s < NUM_SUBGROUPS; ++s) {
+            uint n = sSubgroupSums[s];
+            sSubgroupSums[s] = running;
+            running += n;
+        }
+    }
+    barrier();
+    uint prefix = sSubgroupSums[gl_SubgroupID] + inclusive - sum;
+    for (uint k = 0u; k < 8u; ++k) {
+        if (base + k < pc.count) pc.data.v[base + k] = prefix;
+        prefix += v[k];
+    }
+    if (lane == 255u && pc.writeBlockSums != 0u) pc.blockSums.v[block] = prefix;
+}

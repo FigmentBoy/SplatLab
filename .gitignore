@@ -1,0 +1,44 @@
+# Build output (CMake/Ninja, Visual Studio, CLion)
+/build*/
+/out/
+/cmake-build-*/
+CMakeUserPresets.json
+/compile_commands.json
+
+# Downloaded models, eval images and generated results (~11 GB)
+/data/
+
+# Compiled shaders and binaries
+*.spv
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.obj
+*.o
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / IDEs
+.vs/
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Runtime files
+imgui.ini
+*.log
