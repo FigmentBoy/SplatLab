@@ -23,7 +23,7 @@ fs::path findModelsDir() {
 }
 
 // point_cloud/iteration_<N>/point_cloud.ply with the largest N.
-fs::path latestPly(const fs::path& modelDir) {
+fs::path findLatestPly(const fs::path& modelDir) {
     std::error_code ec;
     fs::path best;
     long bestIter = -1;
@@ -54,6 +54,10 @@ bool ModelLibrary::init() {
     return true; // a missing models directory is not an error
 }
 
+std::string ModelLibrary::latestPly(const std::string& modelDir) {
+    return findLatestPly(fs::u8path(modelDir)).u8string();
+}
+
 void ModelLibrary::refresh() {
     m_models.clear();
     fs::path root = findModelsDir();
@@ -63,7 +67,7 @@ void ModelLibrary::refresh() {
     std::error_code ec;
     for (const auto& entry : fs::directory_iterator(root, ec)) {
         if (!entry.is_directory(ec)) continue;
-        fs::path ply = latestPly(entry.path());
+        fs::path ply = findLatestPly(entry.path());
         if (ply.empty()) continue;
         ModelEntry model;
         model.name = entry.path().filename().string();

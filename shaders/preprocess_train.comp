@@ -1,0 +1,7 @@
+#version 460
+// Forward preprocessing for training: reads the raw parameters the trainer
+// optimizes (log scales, raw quaternions, opacity logits, split SH buffers)
+// and activates them, so the trainer never needs an activated copy.
+#extension GL_GOOGLE_include_directive : require
+#define TRAINING_INPUTS 1
+#include "preprocess_body.glsl"

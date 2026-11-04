@@ -66,6 +66,12 @@ void Options::printUsage(const char* program) {
         "  --vsync                 enable vsync in the viewer\n"
         "  --validation            enable Vulkan validation layers if installed\n"
         "\n"
+        "Training (viewer only; see trainer/):\n"
+        "  --train <video>         train a splat from a video (or image folder), showing progress\n"
+        "  --train-out <dir>       output model folder (default data/models/<video name>)\n"
+        "  --train-iterations <n>  optimization iterations (default 30000)\n"
+        "  --train-frames <n>      frames extracted from the video (default 200)\n"
+        "\n"
         "Viewer controls:\n"
         "  Left click capture mouse | Esc release mouse\n"
         "  While captured: mouse look | WASD move | Space/Shift up/down | Ctrl fast | scroll speed\n"
@@ -144,6 +150,14 @@ bool Options::init(int argc, char** argv) {
             if (!nextNumber(shDegree)) return false;
         } else if (arg == "--scale-modifier") {
             if (!nextNumber(scaleModifier)) return false;
+        } else if (arg == "--train") {
+            if (!next(trainInput)) return false;
+        } else if (arg == "--train-out") {
+            if (!next(trainOutput)) return false;
+        } else if (arg == "--train-iterations") {
+            if (!nextNumber(trainIterations)) return false;
+        } else if (arg == "--train-frames") {
+            if (!nextNumber(trainFrames)) return false;
         } else if (arg == "--vsync") {
             vsync = true;
         } else if (arg == "--validation") {

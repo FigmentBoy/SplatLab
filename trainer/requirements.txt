@@ -1,0 +1,7 @@
+# PyTorch with CUDA comes from the PyTorch index:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# (trainer/bootstrap.py installs everything automatically.)
+torch
+numpy
+opencv-python-headless
+pycolmap

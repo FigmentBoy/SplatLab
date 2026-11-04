@@ -9,6 +9,7 @@
 #include "gui/Gui.hpp"
 #include "gui/LoadingOverlay.hpp"
 #include "gui/ModelMenu.hpp"
+#include "gui/TrainPanel.hpp"
 #include "io/CameraSet.hpp"
 #include "io/ModelLibrary.hpp"
 #include "io/ImageWriter.hpp"
@@ -17,6 +18,8 @@
 #include "vk/Buffer.hpp"
 #include "vk/Swapchain.hpp"
 #include "vk/VulkanContext.hpp"
+
+#include <imgui.h>
 
 #include <chrono>
 #include <cstdio>
@@ -65,15 +68,24 @@ bool Viewer::init(const Options& options, std::unique_ptr<CameraSet> cameras) {
     m_gui = Gui::create(*m_ctx, *m_window, *m_swapchain);
     if (!m_gui) return false;
     auto modelMenu = ModelMenu::create([this](const ModelEntry& model) {
-        requestLoad(LoadKind::Model, model.plyPath, model.camerasPath);
+        requestUserLoad(LoadKind::Model, model.plyPath, model.camerasPath);
     });
     if (!modelMenu) return false;
+    m_modelMenu = modelMenu.get();
     m_gui->addModule(std::move(modelMenu));
     auto fileMenu = FileMenu::create(
-        [this](const std::string& path) { requestLoad(LoadKind::Ply, path, std::string()); },
-        [this](const std::string& path) { requestLoad(LoadKind::Cameras, std::string(), path); });
+        [this](const std::string& path) { requestUserLoad(LoadKind::Ply, path, std::string()); },
+        [this](const std::string& path) { requestUserLoad(LoadKind::Cameras, std::string(), path); });
     if (!fileMenu) return false;
+    m_fileMenu = fileMenu.get();
     m_gui->addModule(std::move(fileMenu));
+    auto trainPanel = TrainPanel::create([this](const TrainingRequest& request) { startTraining(request); },
+                                         [this] {
+                                             if (m_training) m_training->cancel();
+                                         });
+    if (!trainPanel) return false;
+    m_trainPanel = trainPanel.get();
+    m_gui->addModule(std::move(trainPanel));
     auto exitMenu = ExitMenu::create([this] { m_window->requestClose(); });
     if (!exitMenu) return false;
     m_gui->addModule(std::move(exitMenu));
@@ -112,11 +124,24 @@ bool Viewer::init(const Options& options, std::unique_ptr<CameraSet> cameras) {
 
     resetCamera();
     if (!options.scenePath.empty()) requestLoad(LoadKind::Ply, options.scenePath, std::string());
+    if (!options.trainInput.empty()) {
+        namespace fs = std::filesystem;
+        TrainingRequest request;
+        request.input = fs::absolute(fs::u8path(options.trainInput)).u8string();
+        request.output = options.trainOutput.empty()
+                             ? (fs::u8path(m_trainPanel->modelsRoot()) / fs::u8path(options.trainInput).stem()).u8string()
+                             : fs::absolute(fs::u8path(options.trainOutput)).u8string();
+        request.iterations = options.trainIterations;
+        request.frames = options.trainFrames;
+        startTraining(request);
+        m_trainPanel->setVisible(true);
+    }
     return true;
 }
 
 Viewer::~Viewer() {
-    m_loader.reset(); // cancels and joins a load in progress
+    m_training.reset(); // stops the trainer
+    m_loader.reset();   // cancels and joins a load in progress
     if (!m_ctx) return;
     m_ctx->waitIdle();
     VkDevice device = m_ctx->device();
@@ -133,6 +158,7 @@ Viewer::~Viewer() {
 bool Viewer::setScene(std::unique_ptr<GaussianCloud> cloud) {
     if (!m_renderer->setScene(*cloud)) return false;
     m_cloud = std::move(cloud);
+    ++m_sceneVersion;
     return true;
 }
 
@@ -149,8 +175,14 @@ void Viewer::setCameras(std::unique_ptr<CameraSet> cameras) {
     }
 }
 
-void Viewer::requestLoad(LoadKind kind, const std::string& plyPath, const std::string& camerasPath) {
-    m_pending = LoadRequest{kind, plyPath, camerasPath};
+void Viewer::requestLoad(LoadKind kind, const std::string& plyPath, const std::string& camerasPath,
+                         const std::string& label) {
+    m_pending = LoadRequest{kind, plyPath, camerasPath, label};
+}
+
+void Viewer::requestUserLoad(LoadKind kind, const std::string& plyPath, const std::string& camerasPath) {
+    if (trainingActive()) return; // the menus are disabled meanwhile
+    requestLoad(kind, plyPath, camerasPath);
 }
 
 void Viewer::updateLoading() {
@@ -178,6 +210,7 @@ void Viewer::updateLoading() {
         LoadRequest request = std::move(*m_pending);
         m_pending.reset();
         m_loadKind = request.kind;
+        m_loadLabel = request.label;
         m_loader = SceneLoader::create(request.plyPath, request.camerasPath);
     }
 }
@@ -202,6 +235,22 @@ void Viewer::finishLoad(LoadKind kind, SceneLoader::Result result) {
         return;
     }
 
+    if (kind == LoadKind::Snapshot) {
+        if (m_training) m_training->setShowing(m_loadLabel);
+        if (result.cameras) {
+            // First result of the run: switch to its cameras and first view.
+            m_trainingCameras.clear();
+            setCameras(std::move(result.cameras));
+            if (!m_cameras->empty()) {
+                applyDatasetCamera(0);
+                m_camerasPanel->setVisible(true);
+            }
+        } else if (!hadScene) {
+            resetCamera();
+        }
+        return;
+    }
+
     if (kind == LoadKind::Model) {
         setCameras(std::move(result.cameras));
         if (m_cameras && !m_cameras->empty()) {
@@ -219,7 +268,8 @@ void Viewer::finishLoad(LoadKind kind, SceneLoader::Result result) {
 }
 
 void Viewer::drawLoadingOverlay() {
-    if (!m_loader) return;
+    // Training results load quietly; the Train window shows what is on screen.
+    if (!m_loader || m_loadKind == LoadKind::Snapshot) return;
     if (m_loaded) {
         char text[96];
         std::snprintf(text, sizeof(text), "Uploading %zu Gaussians to the GPU...", m_loaded->cloud->size());
@@ -287,12 +337,24 @@ bool Viewer::run() {
     int frames = 0;
     double frameMsSum = 0.0;
 
-    while (!m_window->shouldClose()) {
-        m_window->pollEvents();
+    for (;;) {
+        // While training, idle at ~30 fps so the trainer gets the GPU.
+        if (trainingActive()) {
+            m_window->waitEvents(1.0 / 30.0);
+        } else {
+            m_window->pollEvents();
+        }
+        if (m_window->shouldClose()) {
+            if (!trainingActive() || m_exitConfirmed) break;
+            m_window->cancelClose(); // X, Alt+F4 or File > Exit during training: ask first
+            m_confirmExit = true;
+            m_controller->releaseMouse();
+        }
         auto now = Clock::now();
         float dt = std::chrono::duration<float>(now - last).count();
         last = now;
 
+        updateTraining();
         updateLoading();
 
         glm::uvec2 fb = m_window->framebufferSize();
@@ -309,6 +371,7 @@ bool Viewer::run() {
         m_gui->setMouseEnabled(!m_controller->mouseCaptured());
         m_gui->beginFrame();
         drawLoadingOverlay();
+        drawExitConfirmation();
         m_gui->endFrame();
 
         handleHotkeys();
@@ -366,8 +429,21 @@ bool Viewer::drawFrame() {
     VkExtent2D extent = m_swapchain->extent();
     m_hasImage = false;
     if (m_cloud) {
-        if (!m_renderer->render(*m_camera, extent.width, extent.height, m_settings, m_swapchain->isBgra())) {
-            return false;
+        // Re-render only when the view, the window size or the scene changed.
+        glm::mat4 view = m_camera->worldMatrix();
+        CameraIntrinsics k = m_camera->intrinsics(extent.width, extent.height);
+        glm::vec2 focal(k.fx, k.fy);
+        bool unchanged = m_renderedVersion == m_sceneVersion && m_renderedView == view &&
+                         m_renderedFocal == focal && m_renderedExtent.width == extent.width &&
+                         m_renderedExtent.height == extent.height;
+        if (!unchanged) {
+            if (!m_renderer->render(*m_camera, extent.width, extent.height, m_settings, m_swapchain->isBgra())) {
+                return false;
+            }
+            m_renderedVersion = m_sceneVersion;
+            m_renderedView = view;
+            m_renderedFocal = focal;
+            m_renderedExtent = extent;
         }
         m_hasImage = true;
     }
@@ -452,4 +528,68 @@ void Viewer::printCameraPose() const {
                 "[%.6f, %.6f, %.6f]], \"fx\": %.4f, \"fy\": %.4f}\n",
                 m_screenshotCounter, extent.width, extent.height, c2w[3][0], c2w[3][1], c2w[3][2], c2w[0][0],
                 c2w[1][0], c2w[2][0], c2w[0][1], c2w[1][1], c2w[2][1], c2w[0][2], c2w[1][2], c2w[2][2], k.fx, k.fy);
+}
+
+bool Viewer::trainingActive() const {
+    return m_training && m_training->status().running;
+}
+
+void Viewer::startTraining(const TrainingRequest& request) {
+    if (trainingActive()) return;
+    m_training = TrainingSession::create(request);
+    m_trainingCameras.clear();
+    m_exitConfirmed = false;
+}
+
+void Viewer::updateTraining() {
+    bool active = trainingActive();
+    if (m_training) {
+        std::vector<TrainingSession::Event> events;
+        m_training->update(events);
+        for (const TrainingSession::Event& e : events) {
+            switch (e.kind) {
+            case TrainingSession::Event::Kind::Cameras:
+                m_trainingCameras = e.path; // loaded with the next point cloud
+                break;
+            case TrainingSession::Event::Kind::Points:
+            case TrainingSession::Event::Kind::Gaussians:
+                requestLoad(LoadKind::Snapshot, e.path, m_trainingCameras, e.label);
+                break;
+            case TrainingSession::Event::Kind::Finished: {
+                std::string ply = ModelLibrary::latestPly(e.path);
+                if (!ply.empty()) requestLoad(LoadKind::Snapshot, ply, m_trainingCameras, "Final model");
+                break;
+            }
+            }
+        }
+        active = trainingActive();
+    }
+    m_trainPanel->setStatus(m_training ? &m_training->status() : nullptr);
+    m_fileMenu->setEnabled(!active);
+    m_modelMenu->setEnabled(!active);
+    if (!active) m_confirmExit = false;
+}
+
+void Viewer::drawExitConfirmation() {
+    if (!m_confirmExit) return;
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowFocus();
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize;
+    if (ImGui::Begin("Quit?", nullptr, flags)) {
+        ImGui::TextUnformatted("Training is in progress. Are you sure you want to quit?");
+        ImGui::TextDisabled("The trainer will be stopped; models saved so far are kept.");
+        ImGui::Spacing();
+        if (ImGui::Button("Quit", ImVec2(120.0f, 0.0f))) {
+            m_exitConfirmed = true;
+            m_confirmExit = false;
+            m_window->requestClose();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Keep training", ImVec2(120.0f, 0.0f)) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            m_confirmExit = false;
+        }
+    }
+    ImGui::End();
 }

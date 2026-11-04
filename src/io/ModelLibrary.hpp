@@ -28,6 +28,10 @@ public:
     // Empty if no data/models directory was found.
     const std::string& rootPath() const { return m_root; }
 
+    // point_cloud/iteration_<N>/point_cloud.ply with the largest N in
+    // `modelDir`, or an empty string.
+    static std::string latestPly(const std::string& modelDir);
+
 private:
     ModelLibrary() = default;
 

@@ -1,9 +1,11 @@
 # Vulkan Gaussian Splat Renderer
 
-Forward-only 3D Gaussian Splatting renderer (CS535 final project, midpoint
-milestone). Loads PLY splats in the reference 3DGS layout, renders them from
-arbitrary camera poses with Vulkan compute shaders, and writes images or shows
-them in an interactive window.
+3D Gaussian Splatting renderer and trainer (CS535 final project). Loads PLY
+splats in the reference 3DGS layout, renders them from arbitrary camera poses
+with Vulkan compute shaders, and writes images or shows them in an interactive
+window. The renderer also has a backward pass, which the Python trainer in
+`trainer/` uses (through PyTorch) to turn a video into a splat. See
+[Trainer](#trainer).
 
 ## Building
 
@@ -80,6 +82,26 @@ kernels read them from there. Per-pixel final transmittance, the last
 contributor and the sorted per-tile lists are kept on the GPU for the backward
 pass.
 
+Training uses `preprocess_train` instead of `preprocess`. It is the same
+shader body (`preprocess_body.glsl`), but it reads the raw parameters (log
+scales, unnormalized quaternions, opacity logits, SH split into DC and the
+rest) and activates them itself. The backward pass is two more dispatches in
+one submission:
+
+10. `render_backward`: per pixel, the tile's list is walked back to front from
+    the last contributor, reconstructing T from the final transmittance (as
+    in the reference `backward.cu`). This gives dL/d(2D mean, conic, opacity,
+    colour). All pixels of a workgroup handle the same Gaussian at once, so the
+    gradients are summed with subgroup adds and one lane per subgroup does the
+    float atomics. The walk also starts at the tile's largest last-contributor
+    index instead of the end of the list.
+11. `preprocess_backward`: dL/d(raw parameters) through the conic inverse, the
+    EWA projection (with the frustum clamp), the covariance R S S^T R^T, the
+    SH evaluation (including its view direction) and the activations.
+
+The backward pass needs `VK_EXT_shader_atomic_float` (buffer float add) and
+subgroup votes.
+
 ## Performance
 
 The reference rasterizer ([Kerbl et al. 2023]) sorts one 64-bit `tile | depth`
@@ -142,6 +164,145 @@ the binning check finds 0 differing floats.
 
 [Kerbl et al. 2023]: https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/
 [Zwicker et al. 2001]: https://doi.org/10.1109/VISUAL.2001.964490
+
+## Trainer
+
+`trainer/` turns a video into a splat, following the final deliverables of the
+proposal:
+
+1. **Frames** (`frames.py`, OpenCV). The video is split into N windows
+   (default 200), and the sharpest of 5 candidate frames in each window is
+   kept, resized to at most 1600 px.
+2. **SfM** (`sfm.py`, pycolmap). SIFT, sequential matching (with an
+   exhaustive fallback when under 60% of the frames register), incremental
+   mapping, then undistortion to a pinhole camera. The scene is normalized so
+   the median SfM point depth is 4.
+3. **Initialization** (`gaussians.py`). One Gaussian per SfM point: colour
+   from the point, scale from the mean distance to its 3 nearest neighbours,
+   opacity 0.1.
+4. **Optimization** (`training.py`). This uses the reference
+   hyperparameters: (1-0.2) L1 + 0.2 (1-SSIM), Adam, an exponentially
+   decaying position learning rate, one more SH band every 1000 iterations,
+   and densification (clone, split, prune, opacity reset) up to iteration
+   15000. The first 300 iterations optimize only colour and opacity. Each
+   iteration runs the Vulkan forward pass, then the loss in PyTorch, then the
+   Vulkan backward pass, then Adam.
+5. **Export** (`export.py`). The output has the reference layout:
+   `point_cloud/iteration_<N>/point_cloud.ply` (7000 and final),
+   `cameras.json`, `test_cameras.json`, `cfg_args` and `input.ply`.
+
+`cameras.json` lists every camera. `test_cameras.json` lists the held-out
+views (every 8th frame), which are never trained on. The trainer reports PSNR
+and SSIM on them, and `tools/eval_reference.py` / `benchmark.py` render them.
+The COLMAP dataset stays in `<output>/source`, so re-running into the same
+folder skips frame extraction and SfM (unless `--redo-sfm` is given).
+
+**Vulkan and PyTorch share memory.** The `splat_vk` Python module
+(`trainer/csrc`, pybind11) allocates the Gaussian parameters, their gradients
+and the image buffers as exportable Vulkan memory
+(`VK_KHR_external_memory_win32` or `_fd`). It imports that memory into CUDA
+with the driver API (`cuImportExternalMemory`), which is loaded at run time,
+so no CUDA toolkit is needed. PyTorch wraps the result as ordinary CUDA
+tensors (`__cuda_array_interface__`). As a consequence:
+
+- The `nn.Parameter`s are views of the buffers the shaders read.
+- The backward pass writes straight into the tensors Adam reads as `.grad`.
+
+Nothing is copied between the APIs. They synchronize on the host: torch's
+stream is drained before each submission, and each submission is waited on.
+The Vulkan device is the one whose UUID matches the CUDA device.
+
+### Running it
+
+From the viewer, open **Train > Train from Video...**, pick a video and press
+**Start training**. Alternatively, run `splat_lab --train video.mp4
+[--train-iterations N]`. The viewer shows the run as it goes:
+
+- the SfM point cloud and the cameras as soon as they exist;
+- the Gaussians at the start, at the end of each phase and every 1000
+  iterations;
+- the final model at the end.
+
+The Train window shows the stage, a progress bar, the loss, PSNR, Gaussian
+count, speed and a log. While training, loading other scenes is disabled, and
+closing the window (X, Alt+F4 or File > Exit) asks for confirmation.
+The viewer starts `trainer/bootstrap.py`, which creates `trainer/.venv` and
+pip-installs anything missing before running `train.py`. That includes
+PyTorch with CUDA, pycolmap and OpenCV. If Python itself is missing, the
+viewer says so.
+
+From the command line:
+
+```sh
+python trainer/bootstrap.py video.mp4 -o data/models/myscene      # sets up the venv, then trains
+trainer/.venv/Scripts/python trainer/train.py video.mp4 -o out    # once set up
+```
+
+Useful options: `--iterations`, `--frames`, `--max-size`, `--no-eval`,
+`--max-gaussians`, `--snapshot-every`, `--redo-sfm` and `--module-dir`.
+`--preview-every N` saves `<output>/previews/iter_N.jpg` every N iterations:
+the current render next to the real frame, with the iteration, Gaussian count
+and PSNR. `--preview-camera i` picks the view; 0 is a held-out one. The
+`splat_vk` module is found in `build*/` automatically. The CMake build
+compiles it against `trainer/.venv` when that exists, otherwise against the
+Python on the path, so build after creating the venv. The module must match
+the Python version that runs the trainer.
+
+### Cloud GPUs
+
+The trainer is headless. On Linux, `-DSPLAT_BUILD_VIEWER=OFF` builds only the
+core and the module, with no window system or GTK needed:
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSPLAT_BUILD_VIEWER=OFF
+cmake --build build --target splat_vk
+python3 trainer/bootstrap.py video.mp4 -o out
+```
+
+You need an NVIDIA driver with Vulkan support (on Ubuntu, the
+`libnvidia-gl-*` package provides the Vulkan ICD) plus `libvulkan1`. There is
+also a Dockerfile; it needs the NVIDIA Container Toolkit on the host:
+
+```sh
+docker build -t splat-trainer .
+docker run --rm --gpus all -v "$PWD/runs:/runs" splat-trainer /runs/video.mp4 -o /runs/out
+```
+
+Copy the output folder into `data/models/` to open it with
+File > Load Scene.
+
+**Free notebooks (Colab / Kaggle).** `trainer/colab.ipynb` runs the trainer
+on a free T4 notebook GPU. It does the following:
+
+1. Installs the Vulkan loader and checks that the runtime exposes NVIDIA's
+   Vulkan driver; it stops if not.
+2. Builds the module.
+3. Takes an uploaded video, or a Kaggle dataset path.
+4. Trains, showing a preview image every `PREVIEW_EVERY` iterations.
+5. Zips the model for download.
+
+Set `REPO_URL` (or upload a zip of the repository) in its first cell. The
+previews, a timelapse GIF and the model zip are copied to a share folder as
+they are produced: Google Drive on Colab (`SHARE_TO_DRIVE`), or the output
+folder on Kaggle.
+
+### Gradient validation
+
+`python trainer/tests/test_gradients.py` checks the Vulkan passes against
+`splat_trainer/reference.py`, a dense float64 PyTorch implementation of the
+same rasterizer (the proposal's PyTorch fallback renderer). The test scene has
+300 Gaussians at 72x52 with SH degrees 0, 1 and 3, a random dL/d(image) and
+an off-centre principal point:
+
+| Check | Result |
+|---|---|
+| Forward, max abs difference | 1.7e-6 |
+| Gradients of all 6 parameter groups vs autograd, max relative error | 3.0e-6 (cosine 1.000000) |
+| Central finite differences of the Vulkan forward, 18 largest gradients | 16 within 5% |
+
+The two finite-difference outliers are discontinuities. In each, a Gaussian
+crosses the 1/255 alpha cutoff or a tile edge when nudged by the step. Like
+the reference, the analytic gradient ignores those events.
 
 ## Validation
 

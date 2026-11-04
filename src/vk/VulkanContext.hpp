@@ -2,8 +2,10 @@
 
 #include "vk/VkCommon.hpp"
 
+#include <array>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -17,6 +19,11 @@ public:
         // device is chosen so that its queue can present to it.
         std::function<VkSurfaceKHR(VkInstance)> createSurface;
         bool enableValidation = false;
+        // Buffers can be exported to other APIs (CUDA), see Buffer::exportHandle().
+        bool externalMemory = false;
+        // Only consider the physical device with this UUID (e.g. the CUDA device
+        // whose memory will be shared).
+        std::optional<std::array<uint8_t, VK_UUID_SIZE>> deviceUuid;
     };
 
     static std::unique_ptr<VulkanContext> create(const CreateInfo& info);
@@ -37,6 +44,10 @@ public:
     const std::string& deviceName() const { return m_deviceName; }
     // Subgroup size of compute shaders (a divisor of 256, between 4 and 128).
     uint32_t subgroupSize() const { return m_subgroupSize; }
+    // Features the backward pass needs: float atomic add on buffers and
+    // subgroup vote operations.
+    bool supportsBackward() const { return m_atomicFloatAdd && m_subgroupVote; }
+    bool externalMemory() const { return m_externalMemory; }
 
     uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags required,
                             VkMemoryPropertyFlags preferred = 0) const;
@@ -64,6 +75,10 @@ private:
     VkPhysicalDeviceMemoryProperties m_memoryProperties{};
     std::string m_deviceName;
     uint32_t m_subgroupSize = 32;
+    bool m_atomicFloatAdd = false;
+    bool m_subgroupVote = false;
+    bool m_externalMemory = false;
+    std::optional<std::array<uint8_t, VK_UUID_SIZE>> m_wantedUuid;
     VkDevice m_device = VK_NULL_HANDLE;
     uint32_t m_queueFamily = 0;
     VkQueue m_queue = VK_NULL_HANDLE;

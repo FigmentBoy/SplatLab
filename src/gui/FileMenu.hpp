@@ -19,6 +19,9 @@ public:
     const char* menuName() const override { return "File"; }
     void drawMenuItems() override;
 
+    // Disabled while training (the viewer then shows the trainer's progress).
+    void setEnabled(bool enabled) { m_enabled = enabled; }
+
 private:
     FileMenu() = default;
 
@@ -28,4 +31,5 @@ private:
     LoadPlyCallback m_onLoadPly;
     LoadCamerasCallback m_onLoadCameras;
     bool m_nfdInitialized = false;
+    bool m_enabled = true;
 };

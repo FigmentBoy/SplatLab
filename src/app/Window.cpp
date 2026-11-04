@@ -59,6 +59,14 @@ void Window::requestClose() {
     glfwSetWindowShouldClose(m_window, GLFW_TRUE);
 }
 
+void Window::cancelClose() {
+    glfwSetWindowShouldClose(m_window, GLFW_FALSE);
+}
+
+void Window::waitEvents(double timeout) {
+    glfwWaitEventsTimeout(timeout);
+}
+
 void Window::pollEvents() {
     glfwPollEvents();
 }

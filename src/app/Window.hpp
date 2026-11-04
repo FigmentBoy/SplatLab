@@ -26,6 +26,10 @@ public:
 
     bool shouldClose() const;
     void requestClose();
+    // Clears a pending close request (e.g. the user cancelled quitting).
+    void cancelClose();
+    // Waits up to `timeout` seconds for events, then processes them.
+    void waitEvents(double timeout);
     void pollEvents();
     void setTitle(const std::string& title);
 

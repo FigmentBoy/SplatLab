@@ -14,6 +14,23 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBits
     return VK_FALSE;
 }
 
+#ifdef _WIN32
+const char* const kExternalMemoryExtension = VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME;
+#else
+const char* const kExternalMemoryExtension = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
+#endif
+
+bool hasDeviceExtension(VkPhysicalDevice pd, const char* name) {
+    uint32_t count = 0;
+    vkEnumerateDeviceExtensionProperties(pd, nullptr, &count, nullptr);
+    std::vector<VkExtensionProperties> exts(count);
+    vkEnumerateDeviceExtensionProperties(pd, nullptr, &count, exts.data());
+    for (const auto& e : exts) {
+        if (std::strcmp(e.extensionName, name) == 0) return true;
+    }
+    return false;
+}
+
 bool hasLayer(const char* name) {
     uint32_t count = 0;
     vkEnumerateInstanceLayerProperties(&count, nullptr);
@@ -39,6 +56,8 @@ bool VulkanContext::init(const CreateInfo& info) {
         if (volkGetInstanceVersion() < VK_API_VERSION_1_2) {
             throw std::runtime_error("Vulkan 1.2 or newer is required");
         }
+        m_externalMemory = info.externalMemory;
+        m_wantedUuid = info.deviceUuid;
         createInstance(info);
         if (info.createSurface) {
             m_surface = info.createSurface(m_instance);
@@ -123,9 +142,13 @@ void VulkanContext::pickPhysicalDevice() {
 
         // The sort and scan kernels rank keys with subgroup ballots and scans.
         VkPhysicalDeviceSubgroupProperties sub{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        VkPhysicalDeviceIDProperties ids{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+        sub.pNext = &ids;
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
         p2.pNext = &sub;
         vkGetPhysicalDeviceProperties2(pd, &p2);
+        if (m_wantedUuid && std::memcmp(ids.deviceUUID, m_wantedUuid->data(), VK_UUID_SIZE) != 0) continue;
+        if (m_externalMemory && !hasDeviceExtension(pd, kExternalMemoryExtension)) continue;
         const VkSubgroupFeatureFlags neededOps =
             VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT;
         if (!(sub.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) || (sub.supportedOperations & neededOps) != neededOps ||
@@ -158,11 +181,13 @@ void VulkanContext::pickPhysicalDevice() {
             m_physicalDevice = pd;
             m_queueFamily = static_cast<uint32_t>(family);
             m_subgroupSize = sub.subgroupSize;
+            m_subgroupVote = (sub.supportedOperations & VK_SUBGROUP_FEATURE_VOTE_BIT) != 0;
         }
     }
     if (!m_physicalDevice) {
-        throw std::runtime_error(
-            "No Vulkan 1.2 GPU with bufferDeviceAddress, subgroup ballot/arithmetic and a compute queue found");
+        throw std::runtime_error(m_wantedUuid ? "No suitable Vulkan device matches the requested device UUID"
+                                              : "No Vulkan 1.2 GPU with bufferDeviceAddress, subgroup "
+                                                "ballot/arithmetic and a compute queue found");
     }
     vkGetPhysicalDeviceProperties(m_physicalDevice, &m_properties);
     vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &m_memoryProperties);
@@ -183,6 +208,26 @@ void VulkanContext::createDevice() {
 
     std::vector<const char*> extensions;
     if (m_surface) extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    if (m_externalMemory) extensions.push_back(kExternalMemoryExtension);
+
+    // Float atomics (backward pass), enabled whenever available.
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomics{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
+    if (hasDeviceExtension(m_physicalDevice, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        query.pNext = &atomics;
+        vkGetPhysicalDeviceFeatures2(m_physicalDevice, &query);
+        if (atomics.shaderBufferFloat32AtomicAdd) {
+            m_atomicFloatAdd = true;
+            VkPhysicalDeviceShaderAtomicFloatFeaturesEXT enable{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
+            enable.shaderBufferFloat32AtomicAdd = VK_TRUE;
+            atomics = enable;
+            atomics.pNext = nullptr;
+            f12.pNext = &atomics;
+            extensions.push_back(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
+        }
+    }
 
     VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     ci.pNext = &f2;

@@ -1,0 +1,245 @@
+#version 460
+// Backward pass of the training preprocess: maps the per-Gaussian gradients
+// accumulated by render_backward (2D mean, conic, opacity, colour) to the raw
+// parameters the trainer optimizes: means, log scales, raw quaternions,
+// opacity logits and SH coefficients. Follows the reference rasterizer's
+// preprocessCUDA / computeCov2DCUDA / computeCov3D / computeColorFromSH
+// backward, including the activations (exp, normalize, sigmoid) the
+// reference leaves to PyTorch autograd.
+//
+// Every gradient entry of the first `count` Gaussians is written (zeros for
+// Gaussians that were not rendered and for SH bands above the active degree),
+// so the outputs can be used directly as the parameters' .grad.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "splat_math.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    FrameParamsRef params;
+    FloatBuf means;
+    FloatBuf scaleLog;
+    FloatBuf rotation;
+    FloatBuf opacityLogit;
+    FloatBuf shDc;
+    FloatBuf shRest;
+    IntBuf radii;          // forward radii (0 = not rendered)
+    Vec4Buf gradAccum;     // 3 vec4 per Gaussian from render_backward
+    FloatBuf gMeans;       // out
+    FloatBuf gScaleLog;    // out
+    FloatBuf gRotation;    // out
+    FloatBuf gOpacityLogit;// out
+    FloatBuf gShDc;        // out
+    FloatBuf gShRest;      // out
+    FloatBuf gMeans2D;     // out: dL/d(mean2D) in pixels (for densification statistics)
+} pc;
+
+// d(normalize(v))/dv applied to dv.
+vec3 dnormvdv(vec3 v, vec3 dv) {
+    float sum2 = dot(v, v);
+    float invSum32 = 1.0 / sqrt(sum2 * sum2 * sum2);
+    return (dv * sum2 - v * dot(v, dv)) * invSum32;
+}
+
+// Gradients of evalSH w.r.t. the coefficients (gSh) and the direction (gDir).
+void evalSHBackward(vec3 sh[16], uint degree, vec3 dir, vec3 g, out vec3 gSh[16], out vec3 gDir) {
+    for (uint k = 0u; k < 16u; ++k) gSh[k] = vec3(0.0);
+    gSh[0] = SH_C0 * g;
+    vec3 dx = vec3(0.0), dy = vec3(0.0), dz = vec3(0.0);
+    if (degree > 0u) {
+        float x = dir.x, y = dir.y, z = dir.z;
+        gSh[1] = -SH_C1 * y * g;
+        gSh[2] = SH_C1 * z * g;
+        gSh[3] = -SH_C1 * x * g;
+        dx = -SH_C1 * sh[3];
+        dy = -SH_C1 * sh[1];
+        dz = SH_C1 * sh[2];
+        if (degree > 1u) {
+            float xx = x * x, yy = y * y, zz = z * z;
+            float xy = x * y, yz = y * z, xz = x * z;
+            gSh[4] = SH_C2[0] * xy * g;
+            gSh[5] = SH_C2[1] * yz * g;
+            gSh[6] = SH_C2[2] * (2.0 * zz - xx - yy) * g;
+            gSh[7] = SH_C2[3] * xz * g;
+            gSh[8] = SH_C2[4] * (xx - yy) * g;
+            dx += SH_C2[0] * y * sh[4] + SH_C2[2] * 2.0 * -x * sh[6] + SH_C2[3] * z * sh[7] +
+                  SH_C2[4] * 2.0 * x * sh[8];
+            dy += SH_C2[0] * x * sh[4] + SH_C2[1] * z * sh[5] + SH_C2[2] * 2.0 * -y * sh[6] +
+                  SH_C2[4] * 2.0 * -y * sh[8];
+            dz += SH_C2[1] * y * sh[5] + SH_C2[2] * 2.0 * 2.0 * z * sh[6] + SH_C2[3] * x * sh[7];
+            if (degree > 2u) {
+                gSh[9] = SH_C3[0] * y * (3.0 * xx - yy) * g;
+                gSh[10] = SH_C3[1] * xy * z * g;
+                gSh[11] = SH_C3[2] * y * (4.0 * zz - xx - yy) * g;
+                gSh[12] = SH_C3[3] * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * g;
+                gSh[13] = SH_C3[4] * x * (4.0 * zz - xx - yy) * g;
+                gSh[14] = SH_C3[5] * z * (xx - yy) * g;
+                gSh[15] = SH_C3[6] * x * (xx - 3.0 * yy) * g;
+                dx += SH_C3[0] * sh[9] * 3.0 * 2.0 * xy + SH_C3[1] * sh[10] * yz +
+                      SH_C3[2] * sh[11] * -2.0 * xy + SH_C3[3] * sh[12] * -3.0 * 2.0 * xz +
+                      SH_C3[4] * sh[13] * (-3.0 * xx + 4.0 * zz - yy) + SH_C3[5] * sh[14] * 2.0 * xz +
+                      SH_C3[6] * sh[15] * 3.0 * (xx - yy);
+                dy += SH_C3[0] * sh[9] * 3.0 * (xx - yy) + SH_C3[1] * sh[10] * xz +
+                      SH_C3[2] * sh[11] * (-3.0 * yy + 4.0 * zz - xx) + SH_C3[3] * sh[12] * -3.0 * 2.0 * yz +
+                      SH_C3[4] * sh[13] * -2.0 * xy + SH_C3[5] * sh[14] * -2.0 * yz +
+                      SH_C3[6] * sh[15] * -3.0 * 2.0 * xy;
+                dz += SH_C3[1] * sh[10] * xy + SH_C3[2] * sh[11] * 4.0 * 2.0 * yz +
+                      SH_C3[3] * sh[12] * 3.0 * (2.0 * zz - xx - yy) + SH_C3[4] * sh[13] * 4.0 * 2.0 * xz +
+                      SH_C3[5] * sh[14] * (xx - yy);
+            }
+        }
+    }
+    gDir = vec3(dot(dx, g), dot(dy, g), dot(dz, g));
+}
+
+void writeZeros(uint idx) {
+    for (uint k = 0u; k < 3u; ++k) {
+        pc.gMeans.v[3u * idx + k] = 0.0;
+        pc.gScaleLog.v[3u * idx + k] = 0.0;
+        pc.gShDc.v[3u * idx + k] = 0.0;
+    }
+    for (uint k = 0u; k < 4u; ++k) pc.gRotation.v[4u * idx + k] = 0.0;
+    for (uint k = 0u; k < 45u; ++k) pc.gShRest.v[45u * idx + k] = 0.0;
+    pc.gOpacityLogit.v[idx] = 0.0;
+    pc.gMeans2D.v[2u * idx] = 0.0;
+    pc.gMeans2D.v[2u * idx + 1u] = 0.0;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.params.misc.x) return;
+    if (pc.radii.v[idx] <= 0) {
+        writeZeros(idx);
+        return;
+    }
+    uint degree = pc.params.misc.y;
+
+    vec4 a0 = pc.gradAccum.v[3u * idx];
+    vec4 a1 = pc.gradAccum.v[3u * idx + 1u];
+    vec4 a2 = pc.gradAccum.v[3u * idx + 2u];
+    vec2 gMean2D = a0.xy;
+    float gA = a0.z, gB = a0.w, gC = a1.x; // conic (xx, xy, yy)
+    float gOpacity = a1.y;
+    vec3 gColor = a2.xyz;
+
+    uint i3 = 3u * idx, i4 = 4u * idx;
+    vec3 pos = vec3(pc.means.v[i3], pc.means.v[i3 + 1u], pc.means.v[i3 + 2u]);
+    vec3 scaleRaw = vec3(pc.scaleLog.v[i3], pc.scaleLog.v[i3 + 1u], pc.scaleLog.v[i3 + 2u]);
+    vec4 qRaw = vec4(pc.rotation.v[i4], pc.rotation.v[i4 + 1u], pc.rotation.v[i4 + 2u], pc.rotation.v[i4 + 3u]);
+    float logit = pc.opacityLogit.v[idx];
+
+    // --- opacity: sigmoid ---------------------------------------------------
+    float opacity = sigmoid(logit);
+    float gLogit = gOpacity * opacity * (1.0 - opacity);
+
+    // --- colour: SH evaluation, clamped at 0 --------------------------------
+    vec3 sh[16];
+    sh[0] = vec3(pc.shDc.v[i3], pc.shDc.v[i3 + 1u], pc.shDc.v[i3 + 2u]);
+    uint count = (degree + 1u) * (degree + 1u);
+    for (uint k = 1u; k < count; ++k) {
+        uint o = 45u * idx + 3u * (k - 1u);
+        sh[k] = vec3(pc.shRest.v[o], pc.shRest.v[o + 1u], pc.shRest.v[o + 2u]);
+    }
+    vec3 dirOrig = pos - pc.params.camPosObj.xyz;
+    vec3 dir = normalize(dirOrig);
+    vec3 rgbRaw = evalSH(sh, degree, dir) + 0.5;
+    gColor *= vec3(greaterThanEqual(rgbRaw, vec3(0.0))); // clamped channels get no gradient
+    vec3 gSh[16];
+    vec3 gDir;
+    evalSHBackward(sh, degree, dir, gColor, gSh, gDir);
+    vec3 gPos = dnormvdv(dirOrig, gDir);
+
+    // --- forward recomputation of the projection ----------------------------
+    mat4 modelView = pc.params.modelView;
+    mat3 W = mat3(modelView);
+    vec3 t = (modelView * vec4(pos, 1.0)).xyz;
+    vec3 s = exp(scaleRaw) * pc.params.frustum.z;
+    vec4 q = normalizeQuat(qRaw);
+    mat3 R = quatToMat(q);
+    mat3 M = R * mat3(s.x, 0.0, 0.0, 0.0, s.y, 0.0, 0.0, 0.0, s.z);
+    mat3 sigma = M * transpose(M);
+
+    float fx = pc.params.intrinsics.x, fy = pc.params.intrinsics.y;
+    float limX = 1.3 * pc.params.frustum.x;
+    float limY = 1.3 * pc.params.frustum.y;
+    float txtz = t.x / t.z, tytz = t.y / t.z;
+    vec3 tc = vec3(clamp(txtz, -limX, limX) * t.z, clamp(tytz, -limY, limY) * t.z, t.z);
+    float xMul = (txtz < -limX || txtz > limX) ? 0.0 : 1.0;
+    float yMul = (tytz < -limY || tytz > limY) ? 0.0 : 1.0;
+    mat3 J = mat3(fx / tc.z, 0.0, 0.0,
+                  0.0, fy / tc.z, 0.0,
+                  -fx * tc.x / (tc.z * tc.z), -fy * tc.y / (tc.z * tc.z), 0.0);
+    mat3 T = J * W;
+    mat3 cov = T * sigma * transpose(T);
+    float a = cov[0][0] + 0.3;
+    float b = cov[0][1];
+    float c = cov[1][1] + 0.3;
+    float det = a * c - b * b;
+
+    // --- conic = inverse(cov2D) -> cov2D ------------------------------------
+    float inv2 = 1.0 / (det * det + 1e-12);
+    float ga = inv2 * (-c * c * gA + b * c * gB + (det - a * c) * gC);
+    float gc = inv2 * (-a * a * gC + a * b * gB + (det - a * c) * gA);
+    float gb = inv2 * (2.0 * b * c * gA - (det + 2.0 * b * b) * gB + 2.0 * a * b * gC);
+
+    // --- cov2D = T Sigma T^T --------------------------------------------------
+    mat3 G2 = mat3(ga, 0.5 * gb, 0.0,
+                   0.5 * gb, gc, 0.0,
+                   0.0, 0.0, 0.0);
+    mat3 gSigma = transpose(T) * G2 * T;
+    mat3 gT = 2.0 * G2 * T * sigma;
+    mat3 gJ = gT * transpose(W);
+
+    // --- J(t): entries (0,0), (1,1), (0,2), (1,2) depend on the clamped t ---
+    float z2 = tc.z * tc.z, z3 = z2 * tc.z;
+    vec3 gt;
+    gt.x = xMul * (-fx / z2) * gJ[2][0];
+    gt.y = yMul * (-fy / z2) * gJ[2][1];
+    gt.z = (-fx / z2) * gJ[0][0] + (-fy / z2) * gJ[1][1] + (2.0 * fx * tc.x / z3) * gJ[2][0] +
+           (2.0 * fy * tc.y / z3) * gJ[2][1];
+
+    // --- mean2D = (fx x/z + cx, fy y/z + cy) ----------------------------------
+    float iz = 1.0 / t.z;
+    gt += vec3(fx * iz * gMean2D.x, fy * iz * gMean2D.y,
+               -(fx * t.x * gMean2D.x + fy * t.y * gMean2D.y) * iz * iz);
+    gPos += transpose(W) * gt;
+
+    // --- Sigma = M M^T, M = R diag(s) ----------------------------------------
+    mat3 gM = 2.0 * gSigma * M;
+    vec3 gS = vec3(dot(gM[0], R[0]), dot(gM[1], R[1]), dot(gM[2], R[2]));
+    mat3 gR = mat3(gM[0] * s.x, gM[1] * s.y, gM[2] * s.z); // gR[col][row]
+    vec3 gScaleLog = gS * s; // d exp(l) / dl = exp(l)
+
+    float r = q.x, x = q.y, y = q.z, z = q.w;
+    // Rij (row i, column j) is R[j][i] in GLSL.
+    float g00 = gR[0][0], g01 = gR[1][0], g02 = gR[2][0];
+    float g10 = gR[0][1], g11 = gR[1][1], g12 = gR[2][1];
+    float g20 = gR[0][2], g21 = gR[1][2], g22 = gR[2][2];
+    vec4 gq;
+    gq.x = 2.0 * (-z * g01 + y * g02 + z * g10 - x * g12 - y * g20 + x * g21);
+    gq.y = 2.0 * (y * g01 + z * g02 + y * g10 - 2.0 * x * g11 - r * g12 + z * g20 + r * g21 - 2.0 * x * g22);
+    gq.z = 2.0 * (-2.0 * y * g00 + x * g01 + r * g02 + x * g10 + z * g12 - r * g20 + z * g21 - 2.0 * y * g22);
+    gq.w = 2.0 * (-2.0 * z * g00 - r * g01 + x * g02 + r * g10 - 2.0 * z * g11 + y * g12 + x * g20 + y * g21);
+    // q = qRaw / |qRaw|
+    float qLen = length(qRaw);
+    vec4 gqRaw = qLen > 0.0 ? (gq - q * dot(q, gq)) / qLen : vec4(0.0);
+
+    // --- write ---------------------------------------------------------------
+    for (uint k = 0u; k < 3u; ++k) {
+        pc.gMeans.v[i3 + k] = gPos[k];
+        pc.gScaleLog.v[i3 + k] = gScaleLog[k];
+        pc.gShDc.v[i3 + k] = gSh[0][k];
+    }
+    for (uint k = 0u; k < 4u; ++k) pc.gRotation.v[i4 + k] = gqRaw[k];
+    pc.gOpacityLogit.v[idx] = gLogit;
+    for (uint k = 1u; k < 16u; ++k) {
+        uint o = 45u * idx + 3u * (k - 1u);
+        vec3 v = k < count ? gSh[k] : vec3(0.0);
+        pc.gShRest.v[o] = v.x;
+        pc.gShRest.v[o + 1u] = v.y;
+        pc.gShRest.v[o + 2u] = v.z;
+    }
+    pc.gMeans2D.v[2u * idx] = gMean2D.x;
+    pc.gMeans2D.v[2u * idx + 1u] = gMean2D.y;
+}

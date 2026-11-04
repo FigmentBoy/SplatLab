@@ -1,0 +1,10 @@
+build*/
+out/
+data/
+**/.venv/
+**/__pycache__/
+.vs/
+.vscode/
+*.pyd
+*.exe
+*.pdb

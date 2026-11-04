@@ -22,9 +22,13 @@ public:
     int menuOrder() const override { return -10; } // first entry of the File menu
     void drawMenuItems() override;
 
+    // Disabled while training.
+    void setEnabled(bool enabled) { m_enabled = enabled; }
+
 private:
     ModelMenu() = default;
 
     LoadModelCallback m_onLoadModel;
+    bool m_enabled = true;
     std::unique_ptr<ModelLibrary> m_library;
 };

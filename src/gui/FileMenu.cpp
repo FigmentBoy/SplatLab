@@ -28,10 +28,10 @@ FileMenu::~FileMenu() {
 
 void FileMenu::drawMenuItems() {
     std::string path;
-    if (ImGui::MenuItem("Load PLY...") && openDialog("Gaussian splat PLY", "ply", path) && m_onLoadPly) {
+    if (ImGui::MenuItem("Load PLY...", nullptr, false, m_enabled) && openDialog("Gaussian splat PLY", "ply", path) && m_onLoadPly) {
         m_onLoadPly(path);
     }
-    if (ImGui::MenuItem("Load Cameras...") && openDialog("3DGS cameras.json", "json", path) && m_onLoadCameras) {
+    if (ImGui::MenuItem("Load Cameras...", nullptr, false, m_enabled) && openDialog("3DGS cameras.json", "json", path) && m_onLoadCameras) {
         m_onLoadCameras(path);
     }
 }

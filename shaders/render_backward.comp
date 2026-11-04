@@ -1,0 +1,149 @@
+#version 460
+// Backward pass of the tile compositing (one workgroup per 16x16 tile).
+//
+// Each pixel walks its tile's depth-sorted list back to front, starting at
+// its last contributor, and reconstructs the transmittance as T / (1 - alpha)
+// from the final transmittance kept by the forward pass, as in the reference
+// rasterizer (diff-gaussian-rasterization, backward.cu renderCUDA). It yields
+// dL/d(mean2D), dL/d(conic), dL/d(opacity) and dL/d(colour) per Gaussian.
+//
+// Differences from the reference that only change speed:
+//   - The traversal starts at the largest last-contributor index of the tile,
+//     skipping list entries no pixel blended.
+//   - All pixels of a workgroup process the same Gaussian at the same time, so
+//     the per-pixel gradients are summed over the subgroup first and a single
+//     lane issues the atomics (one atomic per subgroup instead of per pixel).
+// Like the reference, the 0.99 alpha clamp is not differentiated through.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_atomic_float : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#include "common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform PushConstants {
+    FrameParamsRef params;
+    UVec2Buf ranges;
+    UintBuf values;       // sorted Gaussian indices
+    Vec2Buf means2D;
+    Vec4Buf conicOpacity;
+    Vec4Buf colorDepth;
+    FloatBuf finalT;      // H*W
+    UintBuf nContrib;     // H*W
+    FloatBuf gradImage;   // dL/d(image), planar CHW
+    FloatBuf gradAccum;   // out (accumulated): 12 floats per Gaussian, see SplatRenderer.cpp
+} pc;
+
+shared uint sIds[TILE_PIXELS];
+shared vec2 sMeans[TILE_PIXELS];
+shared vec4 sConicOpacity[TILE_PIXELS];
+shared vec3 sColors[TILE_PIXELS];
+shared uint sMaxContrib;
+
+void main() {
+    uint width = pc.params.dims.x;
+    uint height = pc.params.dims.y;
+    uint tilesX = pc.params.dims.z;
+    uint tid = gl_LocalInvocationIndex;
+
+    uvec2 pix = gl_WorkGroupID.xy * TILE_SIZE + gl_LocalInvocationID.xy;
+    uint pixId = width * pix.y + pix.x;
+    vec2 pixf = vec2(pix);
+    bool inside = pix.x < width && pix.y < height;
+
+    uvec2 range = pc.ranges.v[gl_WorkGroupID.y * tilesX + gl_WorkGroupID.x];
+
+    float Tfinal = 1.0;
+    uint last = 0u;
+    vec3 dLdPixel = vec3(0.0);
+    if (inside) {
+        uint planeSize = width * height;
+        Tfinal = pc.finalT.v[pixId];
+        last = pc.nContrib.v[pixId];
+        dLdPixel = vec3(pc.gradImage.v[pixId], pc.gradImage.v[planeSize + pixId],
+                        pc.gradImage.v[2u * planeSize + pixId]);
+    }
+
+    if (tid == 0u) sMaxContrib = 0u;
+    barrier();
+    atomicMax(sMaxContrib, last);
+    barrier();
+    uint count = min(sMaxContrib, range.y - range.x); // list entries [0, count) can matter
+
+    float T = Tfinal;
+    float bgDot = dot(pc.params.background.rgb, dLdPixel);
+    vec3 accumRec = vec3(0.0);
+    vec3 lastColor = vec3(0.0);
+    float lastAlpha = 0.0;
+
+    uint rounds = (count + TILE_PIXELS - 1u) / TILE_PIXELS;
+    for (uint r = 0u; r < rounds; ++r) {
+        // Fetch the next batch, back to front.
+        barrier();
+        int listIdx = int(count) - 1 - int(r * TILE_PIXELS + tid);
+        if (listIdx >= 0) {
+            uint id = pc.values.v[range.x + uint(listIdx)];
+            sIds[tid] = id;
+            sMeans[tid] = pc.means2D.v[id];
+            sConicOpacity[tid] = pc.conicOpacity.v[id];
+            sColors[tid] = pc.colorDepth.v[id].rgb;
+        }
+        barrier();
+
+        uint batch = min(TILE_PIXELS, count - r * TILE_PIXELS);
+        for (uint j = 0u; j < batch; ++j) {
+            uint entry = count - 1u - (r * TILE_PIXELS + j); // index within the tile list
+            vec2 d = sMeans[j] - pixf;
+            vec4 co = sConicOpacity[j];
+            float power = -0.5 * (co.x * d.x * d.x + co.z * d.y * d.y) - co.y * d.x * d.y;
+            float G = exp(power);
+            float alpha = min(0.99, co.w * G);
+            bool valid = inside && entry < last && power <= 0.0 && alpha >= 1.0 / 255.0;
+
+            vec2 gMean = vec2(0.0);
+            vec3 gConic = vec3(0.0);
+            float gOpacity = 0.0;
+            vec3 gColor = vec3(0.0);
+            if (valid) {
+                T = T / (1.0 - alpha);
+                vec3 c = sColors[j];
+                accumRec = lastAlpha * lastColor + (1.0 - lastAlpha) * accumRec;
+                lastColor = c;
+                gColor = (alpha * T) * dLdPixel;
+                float dLdAlpha = dot(c - accumRec, dLdPixel) * T;
+                lastAlpha = alpha;
+                dLdAlpha += (-Tfinal / (1.0 - alpha)) * bgDot;
+
+                float dLdG = co.w * dLdAlpha;
+                float gdx = G * d.x;
+                float gdy = G * d.y;
+                // d = mean - pixel, so d(d)/d(mean) = 1 (pixel units).
+                gMean = dLdG * vec2(-gdx * co.x - gdy * co.y, -gdy * co.z - gdx * co.y);
+                // power = -A dx^2/2 - C dy^2/2 - B dx dy
+                gConic = dLdG * vec3(-0.5 * gdx * d.x, -gdx * d.y, -0.5 * gdy * d.y);
+                gOpacity = G * dLdAlpha;
+            }
+
+            if (subgroupAny(valid)) {
+                gMean = subgroupAdd(gMean);
+                gConic = subgroupAdd(gConic);
+                gOpacity = subgroupAdd(gOpacity);
+                gColor = subgroupAdd(gColor);
+                if (subgroupElect()) {
+                    uint o = 12u * sIds[j];
+                    atomicAdd(pc.gradAccum.v[o + 0u], gMean.x);
+                    atomicAdd(pc.gradAccum.v[o + 1u], gMean.y);
+                    atomicAdd(pc.gradAccum.v[o + 2u], gConic.x);
+                    atomicAdd(pc.gradAccum.v[o + 3u], gConic.y);
+                    atomicAdd(pc.gradAccum.v[o + 4u], gConic.z);
+                    atomicAdd(pc.gradAccum.v[o + 5u], gOpacity);
+                    atomicAdd(pc.gradAccum.v[o + 8u], gColor.r);
+                    atomicAdd(pc.gradAccum.v[o + 9u], gColor.g);
+                    atomicAdd(pc.gradAccum.v[o + 10u], gColor.b);
+                }
+            }
+        }
+    }
+}

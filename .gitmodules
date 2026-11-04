@@ -34,3 +34,7 @@
 	path = externals/nativefiledialog-extended
 	url = https://github.com/btzy/nativefiledialog-extended.git
 	shallow = true
+[submodule "externals/pybind11"]
+	path = externals/pybind11
+	url = https://github.com/pybind/pybind11.git
+	shallow = true

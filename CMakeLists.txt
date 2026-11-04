@@ -8,6 +8,14 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(EXTERNALS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/externals")
 
+# The viewer needs a window system (GLFW, ImGui, native file dialogs). Turn it
+# off for headless machines (cloud GPUs), which only need the trainer module.
+option(SPLAT_BUILD_VIEWER "Build the splat_lab viewer / offline renderer" ON)
+option(SPLAT_BUILD_PYTHON "Build the splat_vk Python module used by trainer/" ON)
+
+# The core library is linked into a Python extension module too.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 if(NOT EXISTS "${EXTERNALS_DIR}/glm/glm/glm.hpp")
     message(FATAL_ERROR "Submodules are missing. Run: git submodule update --init --recursive")
 endif()
@@ -28,6 +36,7 @@ if(WIN32)
     target_compile_definitions(volk PUBLIC VK_USE_PLATFORM_WIN32_KHR WIN32_LEAN_AND_MEAN NOMINMAX)
 endif()
 
+if(SPLAT_BUILD_VIEWER)
 # GLFW (windowing)
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -54,6 +63,7 @@ target_link_libraries(imgui PUBLIC volk glfw)
 set(NFD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(NFD_INSTALL OFF CACHE BOOL "" FORCE)
 add_subdirectory("${EXTERNALS_DIR}/nativefiledialog-extended" EXCLUDE_FROM_ALL)
+endif()
 
 # Header-only libraries
 add_library(glm_headers INTERFACE)
@@ -119,27 +129,80 @@ endforeach()
 add_custom_target(shaders DEPENDS ${SHADER_HEADERS} SOURCES ${SHADER_SOURCES} ${SHADER_INCLUDES})
 
 # ---------------------------------------------------------------------------
-# Renderer executable
+# Core library: Vulkan context, renderer (forward + backward), scene and I/O.
+# Shared by the viewer executable and the Python module.
 # ---------------------------------------------------------------------------
-file(GLOB_RECURSE PROJECT_SOURCES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.hpp"
+function(splat_warnings target)
+    if(MSVC AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8 /bigobj)
+    else()
+        # `VkFooInfo info{VK_STRUCTURE_TYPE_FOO}` intentionally zero-fills the rest.
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
+    endif()
+endfunction()
+
+file(GLOB_RECURSE CORE_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/core/*.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vk/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/vk/*.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/render/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/render/*.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/scene/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/scene/*.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/io/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/io/*.hpp"
 )
+add_library(splat_core STATIC ${CORE_SOURCES})
+add_dependencies(splat_core shaders)
+target_include_directories(splat_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src" "${SHADER_GEN_DIR}")
+target_link_libraries(splat_core PUBLIC volk glm_headers stb_headers json_headers)
+if(UNIX)
+    find_package(Threads REQUIRED)
+    target_link_libraries(splat_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+endif()
+splat_warnings(splat_core)
 
-add_executable(splat_lab ${PROJECT_SOURCES})
-add_dependencies(splat_lab shaders)
+# ---------------------------------------------------------------------------
+# Viewer / offline renderer executable
+# ---------------------------------------------------------------------------
+if(SPLAT_BUILD_VIEWER)
+    file(GLOB_RECURSE APP_SOURCES CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/app/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/app/*.hpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/gui/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/gui/*.hpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp"
+    )
+    add_executable(splat_lab ${APP_SOURCES})
+    target_link_libraries(splat_lab PRIVATE splat_core glfw imgui nfd)
+    target_compile_definitions(splat_lab PRIVATE GLFW_INCLUDE_NONE)
+    splat_warnings(splat_lab)
+    if(MSVC AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        set_property(DIRECTORY PROPERTY VS_STARTUP_PROJECT splat_lab)
+    endif()
+endif()
 
-target_include_directories(splat_lab PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    "${SHADER_GEN_DIR}"
-)
-target_link_libraries(splat_lab PRIVATE volk glfw imgui nfd glm_headers stb_headers json_headers)
-target_compile_definitions(splat_lab PRIVATE GLFW_INCLUDE_NONE)
-
-if(MSVC AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    target_compile_options(splat_lab PRIVATE /W4 /permissive- /utf-8 /bigobj)
-    set_property(DIRECTORY PROPERTY VS_STARTUP_PROJECT splat_lab)
-else()
-    # `VkFooInfo info{VK_STRUCTURE_TYPE_FOO}` intentionally zero-fills the rest.
-    target_compile_options(splat_lab PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
+# ---------------------------------------------------------------------------
+# Python module for the trainer (trainer/): the renderer's forward and
+# backward passes on buffers shared with PyTorch through CUDA external memory.
+# The CUDA driver is loaded at runtime, so no CUDA toolkit is needed.
+# ---------------------------------------------------------------------------
+if(SPLAT_BUILD_PYTHON)
+    # Build against the trainer's virtual environment when it exists.
+    if(NOT DEFINED Python_EXECUTABLE)
+        foreach(candidate "${CMAKE_CURRENT_SOURCE_DIR}/trainer/.venv/Scripts/python.exe"
+                          "${CMAKE_CURRENT_SOURCE_DIR}/trainer/.venv/bin/python")
+            if(EXISTS "${candidate}")
+                set(Python_EXECUTABLE "${candidate}")
+                break()
+            endif()
+        endforeach()
+    endif()
+    find_package(Python 3.9 COMPONENTS Interpreter Development.Module)
+    if(Python_FOUND)
+        set(PYBIND11_FINDPYTHON ON)
+        add_subdirectory("${EXTERNALS_DIR}/pybind11" EXCLUDE_FROM_ALL)
+        file(GLOB TRAINER_CSRC CONFIGURE_DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/trainer/csrc/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/trainer/csrc/*.hpp")
+        pybind11_add_module(splat_vk ${TRAINER_CSRC})
+        target_link_libraries(splat_vk PRIVATE splat_core)
+        splat_warnings(splat_vk)
+        message(STATUS "Building the splat_vk Python module for ${Python_EXECUTABLE}")
+    else()
+        message(WARNING "Python development files not found; the trainer module (splat_vk) is not built")
+    endif()
 endif()

@@ -39,6 +39,12 @@ public:
     bool vsync = false;
     bool help = false;
 
+    // Viewer: start training on this video right away (Train > Train from Video).
+    std::string trainInput;
+    std::string trainOutput; // default: data/models/<video name>
+    int trainIterations = 30000;
+    int trainFrames = 200;
+
 private:
     Options() = default;
 };

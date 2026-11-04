@@ -22,7 +22,7 @@ void ModelMenu::drawMenuItems() {
     // Called inside the File menu's popup window: rescan whenever it opens.
     if (ImGui::IsWindowAppearing()) m_library->refresh();
 
-    if (!ImGui::BeginMenu("Load Scene")) return;
+    if (!ImGui::BeginMenu("Load Scene", m_enabled)) return;
     const auto& models = m_library->models();
     if (m_library->rootPath().empty()) {
         ImGui::TextDisabled("No data/models folder found");
